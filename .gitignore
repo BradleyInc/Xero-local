@@ -1,0 +1,19 @@
+# Credentials and OAuth tokens — never commit these
+.env
+xero_token.json
+
+# Claude Code internal directory
+.claude/
+
+# Org-specific working notes
+bookkeeping prompt.txt
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Editor / OS
+.DS_Store
+Thumbs.db
+*.swp
