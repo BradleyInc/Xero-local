@@ -4,9 +4,9 @@ Xero AP/GST Processing Agent — Ollama Mode
 Same hybrid Python/Xero orchestration as xero_ap_agent.py, but uses the
 Ollama Python library for reasoning instead of the Anthropic Claude API.
 
-Supports any model available in your local Ollama installation — local models
-(llama3.1, qwen2.5, mistral, etc.) or cloud models routed through Ollama —
-bringing API token costs to zero (local electricity only).
+Supports any model available via Ollama — local models (llama3.1, qwen2.5,
+mistral, etc.) or models served by a remote Ollama host (cloud GPU, shared
+server, etc.) — with no per-token API costs.
 
 Usage:
     python xero_ap_agent_ollama.py
@@ -24,6 +24,7 @@ Recommended models (tool calling + good instruction following):
 """
 
 import json
+import os
 
 import customtkinter as ctk
 import ollama
@@ -47,6 +48,8 @@ from xero_mcp_server import (
 
 
 # ── Structured output schema ──────────────────────────────────────────────────
+# TODO: LineItem, BillDecision, and _DECISION_SCHEMA are duplicated in
+#       xero_ap_agent.py — extract to a shared xero_ap_shared.py module.
 
 class LineItem(BaseModel):
     Description: str
@@ -216,7 +219,7 @@ _OLLAMA_TOOLS = [
 
 # ── Within-run contact cache ──────────────────────────────────────────────────
 
-_contacts_created_this_run: dict[str, str] = {}
+_contacts_created_this_run: dict[tuple[str, str], str] = {}
 
 
 # ── Vision model detection ────────────────────────────────────────────────────
@@ -231,6 +234,11 @@ _VISION_KEYWORDS = {
 def _supports_vision(model_name: str) -> bool:
     name_lower = model_name.lower()
     return any(kw in name_lower for kw in _VISION_KEYWORDS)
+
+
+# ── Ollama host default (overridable via OLLAMA_HOST env var) ─────────────────
+
+_DEFAULT_HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
 
 
 # ── Attachment size limits ────────────────────────────────────────────────────
@@ -297,15 +305,15 @@ def _dispatch_tool(tenant_id: str, tool_call) -> str:
     if name == "create_contact":
         contact_name = args.get("name", "")
         email = args.get("email")
-        name_key = contact_name.lower().strip()
+        cache_key = (tenant_id, contact_name.lower().strip())
 
-        if name_key in _contacts_created_this_run:
+        if cache_key in _contacts_created_this_run:
             _log(f"  create_contact({contact_name!r}): using cached result from this run")
-            return _contacts_created_this_run[name_key]
+            return _contacts_created_this_run[cache_key]
 
         _log(f"  create_contact({contact_name!r}, email={email!r})")
         result = xero_create_contact(tenant_id, contact_name, email)
-        _contacts_created_this_run[name_key] = result
+        _contacts_created_this_run[cache_key] = result
 
         # Verify the contact round-trips in Xero search before proceeding.
         verify_raw = xero_get_contacts(tenant_id, contact_name)
@@ -326,6 +334,7 @@ def _dispatch_tool(tenant_id: str, tool_call) -> str:
 
 def _reason_about_bill(
     model: str,
+    client: ollama.Client,
     tenant_id: str,
     invoice: dict,
     attachment_text: str,
@@ -364,7 +373,7 @@ def _reason_about_bill(
 
     # ── Phase 1: tool loop ────────────────────────────────────────────────────
     for _attempt in range(8):
-        response = ollama.chat(
+        response = client.chat(
             model=model,
             messages=messages,
             tools=_OLLAMA_TOOLS,
@@ -390,7 +399,7 @@ def _reason_about_bill(
         "content": "Now return your final structured JSON decision for this bill.",
     })
 
-    final = ollama.chat(
+    final = client.chat(
         model=model,
         messages=messages,
         format=_DECISION_SCHEMA,
@@ -406,30 +415,15 @@ def _reason_about_bill(
 
 def _select_model_and_tenants_gui(
     tenants: list[dict],
-) -> tuple[str | None, list[dict]]:
+) -> tuple[str | None, list[dict], "ollama.Client | None"]:
     """
     Show a single GUI window for choosing:
+      - Ollama host URL (local or remote)
       - Which Ollama model to use for reasoning
       - Which Xero organisations to process
 
-    Returns (model_name, selected_tenants) or (None, []) if cancelled.
+    Returns (model_name, selected_tenants, ollama_client) or (None, [], None) if cancelled.
     """
-    # ── Pre-fetch: Ollama models ──────────────────────────────────────────────
-    try:
-        available_models = sorted(
-            ollama.list().models,
-            key=lambda m: m.size,
-            reverse=True,
-        )
-    except Exception as exc:
-        print(f"ERROR: Could not connect to Ollama — {exc}")
-        print("Make sure Ollama is installed and running (https://ollama.com).")
-        return None, []
-
-    if not available_models:
-        print("ERROR: No models found in Ollama. Run 'ollama pull <model>' to install one.")
-        return None, []
-
     # ── Pre-fetch: draft bill counts ──────────────────────────────────────────
     print("Checking draft bill counts...")
     bill_counts: dict[str, int] = {}
@@ -444,6 +438,8 @@ def _select_model_and_tenants_gui(
     # ── Build GUI ─────────────────────────────────────────────────────────────
     result_model: list[str] = []
     result_tenants: list[dict] = []
+    result_client: list[ollama.Client] = []
+    connected_client: list[ollama.Client] = []  # client from the last successful Connect
 
     ctk.set_appearance_mode("system")
     ctk.set_default_color_theme("blue")
@@ -453,10 +449,9 @@ def _select_model_and_tenants_gui(
     root.resizable(False, False)
 
     win_w = 580
-    model_list_h = min(len(available_models) * 48, 240)
+    model_list_h = 220
     org_list_h = min(len(tenants) * 48, 200)
-    win_h = 100 + 50 + model_list_h + 50 + org_list_h + 120
-    win_h = max(500, min(win_h, 820))
+    win_h = max(500, min(100 + 70 + 60 + model_list_h + 50 + org_list_h + 120, 860))
 
     root.update_idletasks()
     sx = (root.winfo_screenwidth() - win_w) // 2
@@ -472,10 +467,30 @@ def _select_model_and_tenants_gui(
 
     ctk.CTkLabel(
         root,
-        text="Select a model and the organisations to process:",
+        text="Select a host, model, and the organisations to process:",
         font=ctk.CTkFont(size=13),
         text_color=("gray40", "gray60"),
     ).pack(pady=(0, 14))
+
+    # ── Host section ──────────────────────────────────────────────────────────
+    ctk.CTkLabel(
+        root,
+        text="Ollama Host",
+        font=ctk.CTkFont(size=14, weight="bold"),
+        anchor="w",
+    ).pack(fill="x", padx=28, pady=(0, 4))
+
+    host_row = ctk.CTkFrame(root, fg_color="transparent")
+    host_row.pack(fill="x", padx=28, pady=(0, 10))
+
+    host_entry = ctk.CTkEntry(host_row, font=ctk.CTkFont(size=13))
+    host_entry.insert(0, _DEFAULT_HOST)
+    host_entry.pack(side="left", fill="x", expand=True, padx=(0, 8))
+
+    # connect_btn wired up after callbacks are defined
+    connect_btn = ctk.CTkButton(host_row, text="Connect", width=100, height=32,
+                                font=ctk.CTkFont(size=13))
+    connect_btn.pack(side="right")
 
     # ── Model section ─────────────────────────────────────────────────────────
     ctk.CTkLabel(
@@ -489,30 +504,17 @@ def _select_model_and_tenants_gui(
     model_scroll.pack(padx=28, pady=(0, 12), fill="x")
 
     model_var = ctk.StringVar(value="")
-
-    def _refresh_run_btn():
-        model_ok = bool(model_var.get())
-        org_ok = any(v.get() for _, v in check_vars)
-        run_btn.configure(state="normal" if (model_ok and org_ok) else "disabled")
-
-    for m in available_models:
-        size_gb = m.size / 1_000_000_000
-        param_size = ""
-        if m.details:
-            param_size = getattr(m.details, "parameter_size", "") or ""
-        vision_badge = "  [vision]" if _supports_vision(m.model) else ""
-        label = f"{m.model}{vision_badge}   {param_size}   {size_gb:.1f} GB".strip()
-
-        ctk.CTkRadioButton(
-            model_scroll,
-            text=label,
-            variable=model_var,
-            value=m.model,
-            font=ctk.CTkFont(size=13),
-            command=_refresh_run_btn,
-        ).pack(anchor="w", padx=12, pady=5)
+    ctk.CTkLabel(
+        model_scroll,
+        text="Enter a host URL above and click Connect to load models.",
+        font=ctk.CTkFont(size=12),
+        text_color=("gray50", "gray50"),
+    ).pack(pady=8)
 
     # ── Org section ───────────────────────────────────────────────────────────
+    # TODO: The bill-count pre-fetch, tenant checkbox rows, badge formatting, and
+    #       Select All / Deselect All buttons here are substantially duplicated in
+    #       xero_ap_agent.py — extract to a shared _build_org_section() helper.
     ctk.CTkLabel(
         root,
         text="Organisations",
@@ -524,7 +526,6 @@ def _select_model_and_tenants_gui(
     org_scroll.pack(padx=28, pady=(0, 8), fill="x")
 
     check_vars: list[tuple[dict, ctk.BooleanVar]] = []
-
     single_tenant = len(tenants) == 1
 
     for tenant in tenants:
@@ -548,7 +549,7 @@ def _select_model_and_tenants_gui(
             text=tenant["name"],
             variable=var,
             font=ctk.CTkFont(size=13, weight="bold"),
-            command=_refresh_run_btn,
+            command=lambda: _refresh_run_btn(),
             width=300,
             state="disabled" if single_tenant else "normal",
         )
@@ -595,24 +596,14 @@ def _select_model_and_tenants_gui(
     action_row = ctk.CTkFrame(root, fg_color="transparent")
     action_row.pack(pady=18)
 
-    def _on_run():
-        result_model.append(model_var.get())
-        result_tenants.extend(t for t, v in check_vars if v.get())
-        root.destroy()
-
-    def _on_cancel():
-        root.destroy()
-
-    # Run is disabled until both a model and at least one org are selected.
-    initial_state = "normal" if (single_tenant and available_models) else "disabled"
+    # Disabled until both a model and at least one org are selected.
     run_btn = ctk.CTkButton(
         action_row,
         text="Run AP Processing",
         width=180,
         height=38,
         font=ctk.CTkFont(size=14, weight="bold"),
-        state=initial_state,
-        command=_on_run,
+        state="disabled",
     )
     run_btn.pack(side="left", padx=10)
 
@@ -624,20 +615,103 @@ def _select_model_and_tenants_gui(
         font=ctk.CTkFont(size=14),
         fg_color=("gray70", "gray30"),
         hover_color=("gray60", "gray40"),
-        command=_on_cancel,
+        command=root.destroy,
     ).pack(side="left", padx=10)
+
+    # ── Callbacks (defined after all widgets so closures resolve correctly) ───
+
+    def _refresh_run_btn() -> None:
+        model_ok = bool(model_var.get())
+        org_ok = any(v.get() for _, v in check_vars)
+        run_btn.configure(state="normal" if (model_ok and org_ok) else "disabled")
+
+    def _load_models(host: str) -> None:
+        for widget in model_scroll.winfo_children():
+            widget.destroy()
+        model_var.set("")
+        connect_btn.configure(state="disabled")
+
+        loading = ctk.CTkLabel(
+            model_scroll, text=f"Connecting to {host} …",
+            font=ctk.CTkFont(size=12), text_color=("gray50", "gray50"),
+        )
+        loading.pack(pady=8)
+        model_scroll.update()
+
+        try:
+            client = ollama.Client(host=host)
+            available = sorted(client.list().models, key=lambda m: m.size, reverse=True)
+        except Exception as exc:
+            for widget in model_scroll.winfo_children():
+                widget.destroy()
+            ctk.CTkLabel(
+                model_scroll, text=f"Connection failed: {exc}",
+                font=ctk.CTkFont(size=12), text_color="red",
+            ).pack(pady=8)
+            connect_btn.configure(state="normal")
+            _refresh_run_btn()
+            return
+
+        connected_client.clear()
+        connected_client.append(client)
+        loading.destroy()
+
+        if not available:
+            ctk.CTkLabel(
+                model_scroll,
+                text="No models found. Run 'ollama pull <model>' to install one.",
+                font=ctk.CTkFont(size=12), text_color=("gray50", "gray50"),
+            ).pack(pady=8)
+            connect_btn.configure(state="normal")
+            _refresh_run_btn()
+            return
+
+        for m in available:
+            size_gb = m.size / 1_000_000_000
+            param_size = ""
+            if m.details:
+                param_size = getattr(m.details, "parameter_size", "") or ""
+            vision_badge = "  [vision]" if _supports_vision(m.model) else ""
+            label = f"{m.model}{vision_badge}   {param_size}   {size_gb:.1f} GB".strip()
+            ctk.CTkRadioButton(
+                model_scroll,
+                text=label,
+                variable=model_var,
+                value=m.model,
+                font=ctk.CTkFont(size=13),
+                command=_refresh_run_btn,
+            ).pack(anchor="w", padx=12, pady=5)
+
+        connect_btn.configure(state="normal")
+        _refresh_run_btn()
+
+    def _on_connect() -> None:
+        _load_models(host_entry.get().strip())
+
+    def _on_run() -> None:
+        result_model.append(model_var.get())
+        result_tenants.extend(t for t, v in check_vars if v.get())
+        result_client.append(connected_client[0])
+        root.destroy()
+
+    connect_btn.configure(command=_on_connect)
+    run_btn.configure(command=_on_run)
+
+    # Auto-connect on startup with the default host.
+    root.after(50, _on_connect)
 
     root.mainloop()
 
     chosen_model = result_model[0] if result_model else None
-    return chosen_model, result_tenants
+    chosen_client = result_client[0] if result_client else None
+    return chosen_model, result_tenants, chosen_client
 
 
 # ── Main orchestration ────────────────────────────────────────────────────────
 
 def run_ap_processing() -> None:
     """
-    Process selected draft AP bills using a locally-running Ollama model.
+    Process selected draft AP bills using an Ollama model (local or remote).
     All Xero API calls are made directly by Python; Ollama handles reasoning.
     """
     # ── Step 0: ensure authenticated ─────────────────────────────────────────
@@ -651,8 +725,8 @@ def run_ap_processing() -> None:
     _log(f"Found {len(tenants)} tenant(s): {[t['name'] for t in tenants]}")
 
     # ── Step 2: select model + orgs via GUI ───────────────────────────────────
-    selected_model, selected_tenants = _select_model_and_tenants_gui(tenants)
-    if not selected_model or not selected_tenants:
+    selected_model, selected_tenants, ollama_client = _select_model_and_tenants_gui(tenants)
+    if not selected_model or not selected_tenants or ollama_client is None:
         print("No model or organisations selected — exiting.")
         return
 
@@ -717,6 +791,7 @@ def run_ap_processing() -> None:
                 _log(f"  Asking Ollama [{selected_model}]...")
                 decision = _reason_about_bill(
                     selected_model,
+                    ollama_client,
                     tenant_id,
                     invoice,
                     attachment_text,

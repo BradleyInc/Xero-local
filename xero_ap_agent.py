@@ -48,10 +48,12 @@ client = anthropic.Anthropic()
 
 # Contacts created during the current run — prevents duplicate creation when the
 # same new supplier appears on multiple bills before Xero's search index catches up.
-_contacts_created_this_run: dict[str, str] = {}
+_contacts_created_this_run: dict[tuple[str, str], str] = {}
 
 
 # ── Structured output schema ──────────────────────────────────────────────────
+# TODO: LineItem, BillDecision, and _DECISION_SCHEMA are duplicated in
+#       xero_ap_agent_ollama.py — extract to a shared xero_ap_shared.py module.
 
 class LineItem(BaseModel):
     Description: str
@@ -308,19 +310,19 @@ def _reason_about_bill(
             elif block.name == "create_contact":
                 name = block.input["name"]
                 email = block.input.get("email")
-                name_key = name.lower().strip()
-                if name_key in _contacts_created_this_run:
+                cache_key = (tenant_id, name.lower().strip())
+                if cache_key in _contacts_created_this_run:
                     _log(f"  create_contact({name!r}): using cached result from this run")
-                    result = _contacts_created_this_run[name_key]
+                    result = _contacts_created_this_run[cache_key]
                 else:
                     _log(f"  create_contact({name!r}, email={email!r})")
                     result = xero_create_contact(tenant_id, name, email)
-                    _contacts_created_this_run[name_key] = result
+                    _contacts_created_this_run[cache_key] = result
                     # Verify the contact round-trips in Xero search before proceeding.
                     verify_raw = xero_get_contacts(tenant_id, name)
                     try:
                         if json.loads(verify_raw):
-                            _log(f"  create_contact: round-trip search verified OK")
+                            _log("  create_contact: round-trip search verified OK")
                         else:
                             _log(
                                 f"  create_contact: round-trip search returned empty "
@@ -396,6 +398,9 @@ def _fetch_attachment_blocks(tenant_id: str, invoice_id: str) -> list[dict]:
 
 
 # ── Organisation selection GUI ────────────────────────────────────────────────
+# TODO: The bill-count pre-fetch, tenant checkbox rows, badge formatting, and
+#       Select All / Deselect All buttons here are substantially duplicated in
+#       xero_ap_agent_ollama.py — extract to a shared _build_org_section() helper.
 
 def _select_tenants_gui(tenants: list[dict]) -> list[dict]:
     """
@@ -530,9 +535,6 @@ def _select_tenants_gui(tenants: list[dict]) -> list[dict]:
         selected_tenants = [t for t, v in check_vars if v.get()]
         root.destroy()
 
-    def _on_cancel():
-        root.destroy()
-
     run_btn = ctk.CTkButton(
         action_row,
         text="Run AP Processing",
@@ -552,7 +554,7 @@ def _select_tenants_gui(tenants: list[dict]) -> list[dict]:
         font=ctk.CTkFont(size=14),
         fg_color=("gray70", "gray30"),
         hover_color=("gray60", "gray40"),
-        command=_on_cancel,
+        command=root.destroy,
     ).pack(side="left", padx=10)
 
     root.mainloop()
@@ -661,11 +663,11 @@ def run_ap_processing() -> None:
                     total_queries += 1
                     continue
 
-                line_dicts = [li.model_dump() for li in decision.line_items] if decision.line_items else None
+                line_dicts = [li.model_dump() for li in decision.line_items]
                 _log(
                     f"  Updating: contact={decision.contact_name!r} "
                     f"ref={decision.reference!r} "
-                    f"lines={len(line_dicts or [])}"
+                    f"lines={len(line_dicts)}"
                 )
                 result: dict = json.loads(
                     xero_update_invoice(
